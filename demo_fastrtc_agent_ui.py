@@ -19,6 +19,7 @@ If port is in use, set:
 from __future__ import annotations
 
 import json
+import io
 import os
 import shutil
 import subprocess
@@ -31,6 +32,7 @@ from queue import Queue, Empty
 
 import gradio as gr
 import numpy as np
+import av
 from fastrtc import WebRTC
 from PIL import Image
 
@@ -161,6 +163,44 @@ def _adb_screencap_png(device_id: str | None, timeout_s: float = 8.0) -> bytes:
     return proc.stdout
 
 
+def _screencap_frame_bgr(device_id: str) -> np.ndarray:
+    png = _adb_screencap_png(device_id)
+    img = Image.open(BytesIO(png)).convert("RGB")
+    rgb = np.asarray(img)
+    return rgb[:, :, ::-1]
+
+
+def _adb_screenrecord_h264_proc(device_id: str | None) -> subprocess.Popen:
+    """Start a long-running H.264 screenrecord stream and return the process.
+
+    Uses: adb exec-out screenrecord --output-format=h264 ... -
+
+    Optional tuning via env vars:
+    - PHONE_SCREENRECORD_SIZE: e.g. "720x1280"
+    - PHONE_SCREENRECORD_BITRATE: integer bps, e.g. "2000000"
+    """
+
+    size = (os.getenv("PHONE_SCREENRECORD_SIZE") or "").strip()
+    bitrate = (os.getenv("PHONE_SCREENRECORD_BITRATE") or "").strip()
+
+    cmd = ["adb"]
+    if device_id:
+        cmd += ["-s", device_id]
+    cmd += ["exec-out", "screenrecord", "--output-format=h264"]
+    if size:
+        cmd += ["--size", size]
+    if bitrate.isdigit():
+        cmd += ["--bit-rate", bitrate]
+    cmd += ["--time-limit", "1800", "-"]
+
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+
+
 def stream_phone_screen(device_choice: str, device_id_manual: str, fps: int):
     """FastRTC WebRTC receive-only video stream handler.
 
@@ -176,27 +216,93 @@ def stream_phone_screen(device_choice: str, device_id_manual: str, fps: int):
     fps = int(fps)
     if fps < 1:
         fps = 1
-    if fps > 10:
-        fps = 10
+    if fps > 60:
+        fps = 60
 
     interval = 1.0 / float(fps)
 
-    # Send the first frame immediately so users see something fast.
-    next_at = 0.0
-    while True:
-        now = time.time()
-        if now < next_at:
-            time.sleep(min(0.05, next_at - now))
-            continue
-        next_at = time.time() + interval
+    # Prefer screenrecord(H.264) for higher FPS; fall back to screencap if needed.
+    max_restarts = 3
+    restarts = 0
+    fallback_only = False
 
-        png = _adb_screencap_png(device_id)
-        # FastRTC encodes outgoing frames as bgr24 internally.
-        # Provide BGR here to avoid swapped colors.
-        img = Image.open(BytesIO(png)).convert("RGB")
-        rgb = np.asarray(img)
-        bgr = rgb[:, :, ::-1]
-        yield bgr
+    while True:
+        if fallback_only:
+            interval_fb = 1.0 / float(min(fps, 10))
+            next_at = 0.0
+            while True:
+                now = time.time()
+                if now < next_at:
+                    time.sleep(min(0.01, next_at - now))
+                    continue
+                next_at = now + interval_fb
+                yield _screencap_frame_bgr(device_id)
+
+        proc: subprocess.Popen | None = None
+        try:
+            proc = _adb_screenrecord_h264_proc(device_id)
+            if proc.stdout is None:
+                raise RuntimeError("screenrecord stdout is not available")
+
+            stream = proc.stdout
+            if not hasattr(stream, "read1"):
+                stream = io.BufferedReader(stream, buffer_size=4096)
+
+            codec = av.CodecContext.create("h264", "r")
+            next_at = 0.0
+            started_at = time.time()
+            produced_any = False
+
+            while True:
+                if not produced_any and (time.time() - started_at) > 1.0:
+                    try:
+                        yield _screencap_frame_bgr(device_id)
+                    except Exception:
+                        pass
+                    produced_any = True
+
+                chunk = stream.read1(4096)
+                if not chunk:
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.005)
+                    continue
+
+                try:
+                    packets = codec.parse(chunk)
+                except Exception:
+                    continue
+
+                for packet in packets:
+                    try:
+                        frames = codec.decode(packet)
+                    except Exception:
+                        continue
+                    for frame in frames:
+                        produced_any = True
+                        now = time.time()
+                        if now < next_at:
+                            continue
+                        next_at = now + interval
+                        yield frame.to_ndarray(format="bgr24")
+
+        except Exception:
+            fallback_only = True
+
+        finally:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        restarts += 1
+        if restarts >= max_restarts:
+            fallback_only = True
 
 
 def run_task(
@@ -428,7 +534,7 @@ def main() -> None:
             with gr.Row():
                 device_choice = gr.Dropdown(label="Detected device", choices=[], value=None, allow_custom_value=True)
                 device_id_manual = gr.Textbox(label="Or type device id", value=os.getenv("PHONE_AGENT_DEVICE_ID", ""))
-            fps = gr.Slider(label="Preview FPS (ADB)", minimum=1, maximum=10, step=1, value=3)
+            fps = gr.Slider(label="Preview FPS (target)", minimum=1, maximum=60, step=1, value=20)
 
         with gr.Row():
             with gr.Column(scale=1):
